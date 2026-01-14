@@ -2,7 +2,7 @@
  * @file main.cpp
  * @brief Sistem Distribuit de Monitorizare și Control (Master Unitbv)
  * @details Implementare Dual-Core ESP32 cu FreeRTOS, BLE și Control Proporțional (PWM)
- * @author Alexandru Gherghe
+ * @author Alexandru Gherghe - Versiune Actualizata ESP32 v3.0
  */
 
 #include <Arduino.h>
@@ -19,8 +19,8 @@
 
 // --- 2. Parametri PWM ---
 const int pwmFreq = 5000;
-const int pwmChannel = 0;
 const int pwmResolution = 8;
+// Nota: In versiunea noua nu mai avem nevoie de "Channel" manual
 
 // --- 3. Variabile Globale ---
 OneWire oneWire(SENSOR_PIN);
@@ -30,7 +30,6 @@ float global_threshold = 25.0; // Prag temperatura (Setpoint)
 bool deviceConnected = false;
 
 // Constanta Proportionala (Kp)
-// Determina cat de agresiv raspunde ventilatorul la eroare
 const float Kp = 50.0; 
 
 // --- 4. FreeRTOS Handles ---
@@ -57,9 +56,12 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
 class ThresholdCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
+        // MODIFICARE v3.0: Folosim String Arduino in loc de std::string
+        String value = pCharacteristic->getValue();
+        
         if (value.length() > 0) {
-            float newThreshold = (float)atof(value.c_str());
+            // MODIFICARE: Conversie directa din String in float
+            float newThreshold = value.toFloat();
             xQueueSend(thresholdQueue, &newThreshold, 0);
         }
     }
@@ -74,23 +76,24 @@ void taskSenzorControl(void *pvParameters) {
     float currentTemp;
     float receivedThreshold;
 
-    ledcSetup(pwmChannel, pwmFreq, pwmResolution);
-    ledcAttachPin(FAN_PIN, pwmChannel);
+    // MODIFICARE v3.0: Noua metoda de atasare PWM
+    ledcAttach(FAN_PIN, pwmFreq, pwmResolution);
 
     for (;;) {
         // 1. Verifica daca s-a schimbat pragul din telefon
         if (xQueueReceive(thresholdQueue, &receivedThreshold, 0) == pdPASS) {
             global_threshold = receivedThreshold;
-            // Confirmare vizuala inapoi in BLE
-            char threshStr[8];
-            dtostrf(global_threshold, 6, 2, threshStr);
-            pThresholdCharacteristic->setValue(threshStr);
+            
+            // Confirmare vizuala inapoi in BLE (Folosim String pentru simplitate)
+            String threshStr = String(global_threshold, 2);
+            pThresholdCharacteristic->setValue(threshStr.c_str());
         }
 
         // 2. Achizitie Temperatura
         sensors.requestTemperatures(); 
         currentTemp = sensors.getTempCByIndex(0);
 
+        // Verificare eroare citire (-127 grade inseamna senzor deconectat)
         if(currentTemp == DEVICE_DISCONNECTED_C) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue; 
@@ -101,15 +104,10 @@ void taskSenzorControl(void *pvParameters) {
         float error = currentTemp - global_threshold;
 
         if (error > 0) {
-            // Calculam turatia proportional cu depasirea temperaturii
-            // Ex: Depasire 1 grad * Kp(50) = Duty 50
-            // Ex: Depasire 3 grade * Kp(50) = Duty 150
             float dutyCalc = error * Kp;
 
-            // Limite minime de pornire ventilator (start-up voltage)
+            // Limite minime si maxime
             if (dutyCalc < 60) dutyCalc = 60; 
-            
-            // Saturatie maxima (8 biti = 255)
             if (dutyCalc > 255) dutyCalc = 255;
 
             pwmDuty = (int)dutyCalc;
@@ -117,12 +115,13 @@ void taskSenzorControl(void *pvParameters) {
             pwmDuty = 0; // Oprit
         }
 
-        ledcWrite(pwmChannel, pwmDuty);
+        // MODIFICARE v3.0: Scriem direct pe PIN, nu pe canal
+        ledcWrite(FAN_PIN, pwmDuty);
 
         // 4. Trimite date spre BLE
         xQueueSend(tempQueue, &currentTemp, 0);
 
-        // 5. Asigura periodicitatea stricta (Jitter minim)
+        // 5. Asigura periodicitatea
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
 }
@@ -134,12 +133,12 @@ void taskBLE(void *pvParameters) {
     float tempToNotify;
 
     for (;;) {
-        // Asteapta date din coada
         if (xQueueReceive(tempQueue, &tempToNotify, portMAX_DELAY) == pdPASS) {
             if (deviceConnected) {
-                char tempStr[8];
-                dtostrf(tempToNotify, 6, 2, tempStr);
-                pTempCharacteristic->setValue(tempStr);
+                // Conversie simpla float -> String -> char array
+                String tempStr = String(tempToNotify, 2);
+                
+                pTempCharacteristic->setValue(tempStr.c_str());
                 pTempCharacteristic->notify();
             }
         }
@@ -175,7 +174,7 @@ void setup() {
     pAdvertising->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
 
-    // Lansare Task-uri pe nuclee diferite
+    // Lansare Task-uri
     xTaskCreatePinnedToCore(taskSenzorControl, "SenzorCtrl", 4096, NULL, 1, &hTaskSenzor, 0);
     xTaskCreatePinnedToCore(taskBLE, "BLECom", 4096, NULL, 1, &hTaskBLE, 1);
 }
